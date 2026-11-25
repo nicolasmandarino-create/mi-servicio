@@ -1,23 +1,40 @@
-name: Compilar APK desde ZIP
+name: Compilar APK y publicar web
 
 on:
   push:
   workflow_dispatch:
+  schedule:
+    # Cada 3 días: solo "toca" la caché de la firma del APK para que GitHub no la borre (no compila nada).
+    - cron: '23 5 */3 * *'
 
 permissions:
   contents: read
 
 jobs:
   apk:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Una compilación por vez: si dos se ejecutaran a la vez, cada una crearía su propia firma y solo una quedaría guardada.
+    concurrency:
+      group: compilar-apk
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Descomprimir el proyecto
         run: |
-          ZIP=$(ls -1 ./*.zip 2>/dev/null | head -1 || true)
+          set -euo pipefail
+          ZIP=""; MEJOR=0
+          while IFS= read -r -d '' f; do
+            t=$(git log -1 --format=%ct -- "$f" || true)
+            t=${t:-0}
+            if [ -z "$ZIP" ] || [ "$t" -gt "$MEJOR" ]; then ZIP="$f"; MEJOR="$t"; fi
+          done < <(find . -maxdepth 1 -type f -iname '*.zip' -print0)
           [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
+          echo "Se usa el ZIP más reciente: $ZIP"
           unzip -q "$ZIP" -d proyecto
           CFG=$(find proyecto -maxdepth 2 -name capacitor.config.json | sort | head -1)
           [ -n "$CFG" ] || { echo "::error::El ZIP no contiene el proyecto de Mi Servicio."; exit 1; }
@@ -51,12 +68,21 @@ jobs:
           distribution: temurin
           java-version: 21
 
+      # Firma estable: la clave de depuración se guarda en la caché de GitHub (no en el repositorio) para que cada
+      # APK nuevo se instale encima del anterior, sin desinstalar y sin perder datos.
+      - name: Recuperar la firma del APK
+        id: firma
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: mi-servicio-firma-v1
+
       - name: Revisar el SDK de Android y aceptar licencias
         run: |
           SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
           SDKM=$(command -v sdkmanager || ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1 || true)
           if [ -n "$SDKM" ]; then yes | timeout 120 "$SDKM" --licenses > /dev/null 2>&1 || true; fi
-          echo "::notice title=Entorno Android::SDK=$SDK | sdkmanager=${SDKM:-no encontrado} | licencias=$(ls "$SDK/licenses" 2>/dev/null | tr '\n' ' ') | plataformas=$(ls "$SDK/platforms" 2>/dev/null | tr '\n' ' ') | build-tools=$(ls "$SDK/build-tools" 2>/dev/null | tr '\n' ' ') | escribible=$([ -w "$SDK" ] && echo si || echo no) | java=$(java -version 2>&1 | grep -m1 version) | node=$(node -v)"
+          echo "::notice title=Entorno Android::SDK=$SDK | sdkmanager=${SDKM:-no encontrado} | licencias=$(ls "$SDK/licenses" 2>/dev/null | tr '\n' ' ') | plataformas=$(ls "$SDK/platforms" 2>/dev/null | tr '\n' ' ') | build-tools=$(ls "$SDK/build-tools" 2>/dev/null | tr '\n' ' ') | escribible=$([ -w "$SDK" ] && echo si || echo no) | android_user_home=${ANDROID_USER_HOME:-no definido} | java=$(java -version 2>&1 | grep -m1 version) | node=$(node -v)"
 
       - name: Preparar el proyecto
         run: |
@@ -76,9 +102,111 @@ jobs:
           cp app/build/outputs/apk/debug/*.apk "$GITHUB_WORKSPACE/salida/"
           ls -lh "$GITHUB_WORKSPACE/salida"
 
+      - name: Estado de la firma
+        run: |
+          KS="$HOME/.android/debug.keystore"
+          if [ ! -f "$KS" ]; then
+            OTRO=$(find "$HOME" -maxdepth 4 -name debug.keystore 2>/dev/null | head -3 | tr '\n' ' ')
+            echo "::warning title=Firma del APK sin guardar::No se encontró la firma en la ubicación esperada (${OTRO:-sin hallazgos}). Las próximas actualizaciones podrían requerir desinstalar la app."
+          elif [ "${{ steps.firma.outputs.cache-hit }}" = "true" ]; then
+            echo "::notice title=Firma del APK::Misma firma que la compilación anterior. Si la app instalada en su teléfono ya viene de una compilación con firma estable, este APK se instala encima, sin desinstalar y sin perder datos."
+          else
+            echo "::warning title=Firma del APK nueva::Este APK tiene una firma nueva (primera vez o la anterior caducó) y queda guardada para las próximas compilaciones. Si ya tiene la app instalada: primero haga la copia de seguridad en Ajustes, desinstale la app, instale este APK e importe la copia."
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: mi-servicio-apk
           path: salida/*.apk
           if-no-files-found: error
           retention-days: 30
+
+  web:
+    if: github.event_name != 'schedule' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Descomprimir el proyecto
+        run: |
+          set -euo pipefail
+          ZIP=""; MEJOR=0
+          while IFS= read -r -d '' f; do
+            t=$(git log -1 --format=%ct -- "$f" || true)
+            t=${t:-0}
+            if [ -z "$ZIP" ] || [ "$t" -gt "$MEJOR" ]; then ZIP="$f"; MEJOR="$t"; fi
+          done < <(find . -maxdepth 1 -type f -iname '*.zip' -print0)
+          [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
+          echo "Se usa el ZIP más reciente: $ZIP"
+          unzip -q "$ZIP" -d proyecto
+          CFG=$(find proyecto -maxdepth 2 -name capacitor.config.json | sort | head -1)
+          [ -n "$CFG" ] || { echo "::error::El ZIP no contiene el proyecto de Mi Servicio."; exit 1; }
+          echo "DIR=$(cd "$(dirname "$CFG")" && pwd)" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Preparar el sitio
+        run: |
+          set -euo pipefail
+          [ -f "$DIR/www/index.html" ] || { echo "::error::El ZIP no contiene la carpeta www con la aplicación."; exit 1; }
+          node "$DIR/scripts/gen-sw.mjs"
+          mkdir -p sitio
+          cp -a "$DIR/www/." sitio/
+          ls -1 sitio | head -20
+
+      - name: Comprobar que GitHub Pages esté activado
+        id: pages
+        uses: actions/configure-pages@v5
+        continue-on-error: true
+
+      - name: Aviso si falta activar GitHub Pages
+        if: steps.pages.outcome == 'failure'
+        run: |
+          echo "::error title=Falta activar GitHub Pages::En el repositorio entre en Settings > Pages, en Source elija GitHub Actions y luego vuelva a ejecutar este flujo (Actions > la ejecución > Re-run all jobs)."
+          exit 1
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: sitio
+
+      - name: Publicar en GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Mostrar la dirección del sitio
+        run: echo "::notice title=Sitio publicado::${{ steps.deployment.outputs.page_url }}"
+
+  mantener-firma:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Mantener viva la firma del APK
+        id: firma
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: mi-servicio-firma-v1
+
+      - name: Estado
+        run: |
+          if [ "${{ steps.firma.outputs.cache-hit }}" = "true" ]; then
+            echo "::notice title=Firma del APK::La firma sigue guardada."
+          else
+            echo "::notice title=Firma del APK::La firma ya no está guardada; la próxima compilación creará una nueva."
+          fi
