@@ -10,18 +10,37 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
       - name: Descomprimir el proyecto
         run: |
-          ZIP=$(ls -1 ./*.zip 2>/dev/null | head -1)
+          ZIP=$(ls -1 ./*.zip 2>/dev/null | head -1 || true)
           [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
           unzip -q "$ZIP" -d proyecto
           CFG=$(find proyecto -maxdepth 2 -name capacitor.config.json | sort | head -1)
           [ -n "$CFG" ] || { echo "::error::El ZIP no contiene el proyecto de Mi Servicio."; exit 1; }
-          echo "DIR=$(dirname "$CFG")" >> "$GITHUB_ENV"
+          echo "DIR=$(cd "$(dirname "$CFG")" && pwd)" >> "$GITHUB_ENV"
+
+      - name: Preparar utilidad de diagnóstico
+        run: |
+          cat > "$RUNNER_TEMP/correr.sh" <<'EOF'
+          # correr "<título>" <comando...>: muestra la salida y, si falla, deja un resumen del error visible en la ejecución.
+          correr() {
+            local titulo="$1" estado resumen log="$RUNNER_TEMP/paso.log"
+            shift
+            set +e
+            "$@" 2>&1 | tee "$log"
+            estado=${PIPESTATUS[0]}
+            set -e
+            if [ "$estado" -ne 0 ]; then
+              resumen=$({ grep -E -A 12 "What went wrong" "$log" | head -30; grep -E "^e: |error:|ERR!|AAPT|ERROR:" "$log" | head -20; echo "--- final del registro ---"; tail -n 12 "$log"; } | tr -d '\r' | sed 's/%/%25/g' | awk '{printf "%s%%0A", $0}')
+              echo "::error title=Falló: $titulo::$resumen"
+            fi
+            return "$estado"
+          }
+          EOF
 
       - uses: actions/setup-node@v4
         with:
@@ -32,23 +51,34 @@ jobs:
           distribution: temurin
           java-version: 21
 
-      - uses: android-actions/setup-android@v3
+      - name: Revisar el SDK de Android y aceptar licencias
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKM=$(command -v sdkmanager || ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | tail -1 || true)
+          if [ -n "$SDKM" ]; then yes | timeout 120 "$SDKM" --licenses > /dev/null 2>&1 || true; fi
+          echo "::notice title=Entorno Android::SDK=$SDK | sdkmanager=${SDKM:-no encontrado} | licencias=$(ls "$SDK/licenses" 2>/dev/null | tr '\n' ' ') | plataformas=$(ls "$SDK/platforms" 2>/dev/null | tr '\n' ' ') | build-tools=$(ls "$SDK/build-tools" 2>/dev/null | tr '\n' ' ') | escribible=$([ -w "$SDK" ] && echo si || echo no) | java=$(java -version 2>&1 | grep -m1 version) | node=$(node -v)"
 
       - name: Preparar el proyecto
-        working-directory: ${{ env.DIR }}
         run: |
-          npm ci
-          [ -d android ] || npx cap add android
-          npm run android:sync
+          source "$RUNNER_TEMP/correr.sh"
+          cd "$DIR"
+          correr "npm ci" npm ci
+          [ -d android ] || correr "cap add android" npx cap add android
+          correr "sincronizar Android" npm run android:sync
           chmod +x android/gradlew
 
       - name: Compilar el APK
-        working-directory: ${{ env.DIR }}/android
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          source "$RUNNER_TEMP/correr.sh"
+          cd "$DIR/android"
+          correr "Gradle assembleDebug" ./gradlew assembleDebug --no-daemon --console=plain
+          mkdir -p "$GITHUB_WORKSPACE/salida"
+          cp app/build/outputs/apk/debug/*.apk "$GITHUB_WORKSPACE/salida/"
+          ls -lh "$GITHUB_WORKSPACE/salida"
 
       - uses: actions/upload-artifact@v4
         with:
           name: mi-servicio-apk
-          path: ${{ env.DIR }}/android/app/build/outputs/apk/debug/*.apk
+          path: salida/*.apk
           if-no-files-found: error
           retention-days: 30
