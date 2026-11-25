@@ -1,0 +1,54 @@
+name: Compilar APK desde ZIP
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Descomprimir el proyecto
+        run: |
+          ZIP=$(ls -1 ./*.zip 2>/dev/null | head -1)
+          [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
+          unzip -q "$ZIP" -d proyecto
+          CFG=$(find proyecto -maxdepth 2 -name capacitor.config.json | sort | head -1)
+          [ -n "$CFG" ] || { echo "::error::El ZIP no contiene el proyecto de Mi Servicio."; exit 1; }
+          echo "DIR=$(dirname "$CFG")" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Preparar el proyecto
+        working-directory: ${{ env.DIR }}
+        run: |
+          npm ci
+          [ -d android ] || npx cap add android
+          npm run android:sync
+          chmod +x android/gradlew
+
+      - name: Compilar el APK
+        working-directory: ${{ env.DIR }}/android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mi-servicio-apk
+          path: ${{ env.DIR }}/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 30
