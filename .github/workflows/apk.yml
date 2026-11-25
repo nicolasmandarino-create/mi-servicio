@@ -32,13 +32,16 @@ jobs:
             t=$(git log -1 --format=%ct -- "$f" || true)
             t=${t:-0}
             if [ -z "$ZIP" ] || [ "$t" -gt "$MEJOR" ]; then ZIP="$f"; MEJOR="$t"; fi
-          done < <(find . -maxdepth 1 -type f -iname '*.zip' -print0)
+          done < <(find . -maxdepth 4 -type f -iname '*.zip' -not -path './.git/*' -print0)
           [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
           echo "Se usa el ZIP más reciente: $ZIP"
           unzip -q "$ZIP" -d proyecto
           CFG=$(find proyecto -maxdepth 2 -name capacitor.config.json | sort | head -1)
           [ -n "$CFG" ] || { echo "::error::El ZIP no contiene el proyecto de Mi Servicio."; exit 1; }
-          echo "DIR=$(cd "$(dirname "$CFG")" && pwd)" >> "$GITHUB_ENV"
+          D=$(cd "$(dirname "$CFG")" && pwd)
+          echo "DIR=$D" >> "$GITHUB_ENV"
+          VER=$(grep -m1 '"version"' "$D/package.json" | sed 's/[^0-9.]//g' || true)
+          echo "::notice title=Proyecto usado::ZIP: $ZIP | versión de la app: ${VER:-desconocida}"
 
       - name: Preparar utilidad de diagnóstico
         run: |
@@ -70,11 +73,12 @@ jobs:
 
       # Firma estable: la clave de depuración se guarda en la caché de GitHub (no en el repositorio) para que cada
       # APK nuevo se instale encima del anterior, sin desinstalar y sin perder datos.
+      # En los ejecutores de GitHub, Android crea esa clave en ~/.config/.android (no en ~/.android).
       - name: Recuperar la firma del APK
         id: firma
         uses: actions/cache@v4
         with:
-          path: ~/.android/debug.keystore
+          path: ~/.config/.android/debug.keystore
           key: mi-servicio-firma-v1
 
       - name: Revisar el SDK de Android y aceptar licencias
@@ -104,9 +108,9 @@ jobs:
 
       - name: Estado de la firma
         run: |
-          KS="$HOME/.android/debug.keystore"
+          KS="$HOME/.config/.android/debug.keystore"
           if [ ! -f "$KS" ]; then
-            OTRO=$(find "$HOME" -maxdepth 4 -name debug.keystore 2>/dev/null | head -3 | tr '\n' ' ')
+            OTRO=$(find "$HOME" -maxdepth 5 -name debug.keystore 2>/dev/null | head -3 | tr '\n' ' ' || true)
             echo "::warning title=Firma del APK sin guardar::No se encontró la firma en la ubicación esperada (${OTRO:-sin hallazgos}). Las próximas actualizaciones podrían requerir desinstalar la app."
           elif [ "${{ steps.firma.outputs.cache-hit }}" = "true" ]; then
             echo "::notice title=Firma del APK::Misma firma que la compilación anterior. Si la app instalada en su teléfono ya viene de una compilación con firma estable, este APK se instala encima, sin desinstalar y sin perder datos."
@@ -148,7 +152,7 @@ jobs:
             t=$(git log -1 --format=%ct -- "$f" || true)
             t=${t:-0}
             if [ -z "$ZIP" ] || [ "$t" -gt "$MEJOR" ]; then ZIP="$f"; MEJOR="$t"; fi
-          done < <(find . -maxdepth 1 -type f -iname '*.zip' -print0)
+          done < <(find . -maxdepth 4 -type f -iname '*.zip' -not -path './.git/*' -print0)
           [ -n "$ZIP" ] || { echo "::error::No hay ningún archivo .zip en el repositorio. Súbalo y vuelva a intentar."; exit 1; }
           echo "Se usa el ZIP más reciente: $ZIP"
           unzip -q "$ZIP" -d proyecto
@@ -174,21 +178,24 @@ jobs:
         uses: actions/configure-pages@v5
         continue-on-error: true
 
+      # Si Pages no está activado, la web de iPhone simplemente no se publica y se deja un aviso: no afecta al APK.
       - name: Aviso si falta activar GitHub Pages
         if: steps.pages.outcome == 'failure'
         run: |
-          echo "::error title=Falta activar GitHub Pages::En el repositorio entre en Settings > Pages, en Source elija GitHub Actions y luego vuelva a ejecutar este flujo (Actions > la ejecución > Re-run all jobs)."
-          exit 1
+          echo "::warning title=Falta activar GitHub Pages (solo para la versión de iPhone)::Para publicar la web entre en Settings > Pages y, en Source, elija GitHub Actions. En la próxima compilación se publica sola. El APK de Android no se ve afectado."
 
       - uses: actions/upload-pages-artifact@v3
+        if: steps.pages.outcome == 'success'
         with:
           path: sitio
 
       - name: Publicar en GitHub Pages
         id: deployment
+        if: steps.pages.outcome == 'success'
         uses: actions/deploy-pages@v4
 
       - name: Mostrar la dirección del sitio
+        if: steps.pages.outcome == 'success'
         run: echo "::notice title=Sitio publicado::${{ steps.deployment.outputs.page_url }}"
 
   mantener-firma:
@@ -200,7 +207,7 @@ jobs:
         id: firma
         uses: actions/cache/restore@v4
         with:
-          path: ~/.android/debug.keystore
+          path: ~/.config/.android/debug.keystore
           key: mi-servicio-firma-v1
 
       - name: Estado
